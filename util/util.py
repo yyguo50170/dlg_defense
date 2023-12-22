@@ -1,4 +1,3 @@
-import copy
 import random
 
 import torch
@@ -8,7 +7,6 @@ import numpy as np
 from torch.autograd import Variable
 from math import radians, cos, sin, asin, sqrt
 from sklearn.preprocessing import MinMaxScaler
-
 # from GeoPrivacy.mechanism import random_laplace_noise
 
 from model.LSTM import LSTMModel
@@ -25,7 +23,7 @@ def init_dataset(args):
         raw_data_np = np.load(data_dir, allow_pickle=True)
         columns_to_normalize = [2, 3]
         scaler = MinMaxScaler()
-        raw_data_np[:, columns_to_normalize] = scaler.fit_transform(raw_data_np[:, columns_to_normalize])
+        # raw_data_np[:, columns_to_normalize] = scaler.fit_transform(raw_data_np[:, columns_to_normalize])
     elif args.dataset_name == 'tokyoci':
         dataset = TokyoCheckinDataset()
         data_dir = 'data/tokyoci.npy'
@@ -60,9 +58,11 @@ def init_loss(model_name):
         loss = nn.MSELoss()
     elif model_name == 'PMF':
         loss = nn.CrossEntropyLoss()
+        # loss = nn.MSELoss()
     else:
         raise ValueError("No such model: " + model_name + "!")
     return loss
+
 
 def GeoGraphI(global_iter, dataset, batch_size, cover, epsilon):
     # gt_data_np
@@ -100,6 +100,47 @@ def GeoGraphI(global_iter, dataset, batch_size, cover, epsilon):
     return gt_data_np, gt_label_np
 
 
+def APGEM(global_iter, dataset, batch_size, cover, epsilon, used_epsilon, asr_t, ait_t):
+    gama_t = 0.5 * asr_t + 0.5 / ait_t
+    remain_epsilon = epsilon - used_epsilon
+    epsilon_t = math.exp(-gama_t) * remain_epsilon
+    used_epsilon += epsilon_t
+
+    # gt_data_np
+    gt_data = []
+    for b in range(batch_size):
+        ord_list = list()
+        p_list = list()
+        for i in range(-cover, cover):
+            if global_iter + i >= 0 and global_iter + i < len(dataset) and i != 0:
+                ord_list.append(global_iter + i)
+                x_loc = dataset[global_iter + i, [2, 3]]
+                t_loc = dataset[global_iter, [2, 3]]
+                dist = ((x_loc[0] - t_loc[0]) ** 2 + (x_loc[1] - t_loc[1]) ** 2) ** 0.5
+                p_list.append(math.exp(- epsilon_t * dist / 2))
+        p_sum = sum(p_list)
+        p_list = [p / p_sum for p in p_list]
+        sampled_idx = random.choices(range(len(p_list)), p_list)[0]
+        gt_data.append(dataset[ord_list[sampled_idx], [2, 3]])
+    gt_data_np = np.array(gt_data)
+    gt_label = []
+    ord_list = list()
+    p_list = list()
+    for i in range(-cover, cover):
+        if global_iter + batch_size + i >= 0 and global_iter + batch_size + i < len(dataset) and i != 0:
+            ord_list.append(global_iter + batch_size + i)
+            x_loc = dataset[global_iter + batch_size + i, [2, 3]]
+            t_loc = dataset[global_iter + batch_size, [2, 3]]
+            dist = ((x_loc[0] - t_loc[0]) ** 2 + (x_loc[1] - t_loc[1]) ** 2) ** 0.5
+            p_list.append(math.exp(- epsilon_t * dist / 2))
+    p_sum = sum(p_list)
+    p_list = [p / p_sum for p in p_list]
+    sampled_idx = random.choices(range(len(p_list)), p_list)[0]
+    gt_label.append(dataset[ord_list[sampled_idx], [2, 3]])
+    gt_label_np = np.array(gt_label)
+    return gt_data_np, gt_label_np, used_epsilon
+
+
 def train_for_loss(args,
                    model_name,
                    model,
@@ -135,41 +176,6 @@ def train_for_loss(args,
     return true_loss
 
 
-def train_for_loss_and_out(args,
-                           model_name,
-                           model,
-                           loss_fn,
-                           batch_size,
-                           gt_data_np,
-                           gt_tim_np,
-                           gt_label_np,
-                           global_iter,
-                           dataset,
-                           device):
-    model.train()
-    if model_name == 'LSTM':
-        gt_data_np_final = gt_data_np.copy()
-        gt_label_np_final = gt_label_np.copy()
-        # ================= Geo-Indistinguishability ==================== #
-        # if args.is_geo:
-        #    for i in range(len(gt_data_np_final)):
-        #        gt_data_np_final[i] += np.array(random_laplace_noise(args.geo_epsilon), dtype=np.float32)
-        #    gt_label_np_final += np.array(random_laplace_noise(args.geo_epsilon), dtype=np.float32)
-        # ======================================================= #
-        # ================ Geo-Graph-Indistinguishability ================ #
-        if args.is_geogi:
-            gt_data_np_final, gt_label_np_final = GeoGraphI(global_iter, dataset, batch_size, args.geogi_cover,
-                                                            args.geogi_epsilon)
-        # ======================================================= #
-        gt_data = torch.from_numpy(gt_data_np_final.reshape(1, batch_size, 2).astype(np.float32)).to(device)
-        gt_label = torch.from_numpy(gt_label_np_final.reshape(1, 2).astype(np.float32)).to(device)
-        out = model(gt_data)
-        true_loss = loss_fn(out, gt_label)
-    else:
-        raise ValueError("No such model: " + model_name + "!")
-    return true_loss, out
-
-
 def init_dummy_data(batch_size, model_name, device):
     if model_name == 'LSTM':
         dummy_data = torch.rand(1, batch_size, 2).to(device).requires_grad_(True)
@@ -179,25 +185,6 @@ def init_dummy_data(batch_size, model_name, device):
         dummy_label = torch.rand(1, 2).to(device).requires_grad_(True)
     else:
         raise ValueError("No such model: " + model_name + "!")
-    return dummy_data, dummy_label
-
-
-def init_dummy_data_from_last(batch_size, device, iter, attack_record):
-    if iter == 0:
-        dummy_data = torch.rand(1, batch_size, 2).to(device).requires_grad_(True)
-        dummy_label = torch.rand(1, 2).to(device).requires_grad_(True)
-        return dummy_data, dummy_label
-
-    # temp = dataset[iter:iter + batch_size, [2, 3]].copy().reshape(1, batch_size, 2).astype(np.float32)
-    # dummy_data = torch.from_numpy(temp).to(device).requires_grad_(True)
-    # temp = dataset[iter + batch_size-1, [2, 3]].reshape(1, 2).astype(np.float32)
-
-    last_seven = attack_record["last_dummy_data"].squeeze(0)[1:]
-    last_label = attack_record["last_dummy_label"].squeeze(0)
-    temp = torch.cat((last_seven, last_label.unsqueeze(0)), dim=0)
-    dummy_data = temp.detach().clone().unsqueeze(0).to(device).requires_grad_(True)
-    temp = attack_record["last_dummy_label"]
-    dummy_label = temp.detach().clone().to(device).requires_grad_(True)
     return dummy_data, dummy_label
 
 
@@ -248,6 +235,7 @@ def find_best_record2(attack_record, dlg_attack_round, gt_label):
                 best_idx = i
                 best_dist = label_dist
         label_dist_list.append([best_idx, best_dist])
+    # print("label_dist_list: {}".format(label_dist_list))
     ridx = np.argmin(np.array(label_dist_list)[:, 1])
     return ridx, label_dist_list[ridx][0], label_dist_list[ridx][1]
 
